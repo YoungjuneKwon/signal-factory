@@ -27,6 +27,7 @@
 13. **[12_user_workflows.md](./12_user_workflows.md)** - 사용자 워크플로우
 14. **[13_business_model.md](./13_business_model.md)** - 비즈니스 모델
 15. **[14_roadmap.md](./14_roadmap.md)** - 개발 로드맵
+16. **[15_testing_guide.md](./15_testing_guide.md)** - 테스팅 가이드
 
 ## 주요 특징
 

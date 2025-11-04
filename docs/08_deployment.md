@@ -76,24 +76,146 @@ spec:
 
 ### GitHub Actions
 
+#### 필수 테스트 정책
+
+**모든 빌드 및 배포는 반드시 단위 테스트를 통과해야 합니다.**
+
+- ✅ 단위 테스트 커버리지 80% 이상 필수
+- ✅ 핵심 비즈니스 로직 90% 이상 필수
+- ✅ 테스트 실패 시 빌드 및 배포 차단
+- ✅ Pull Request 병합 전 테스트 필수
+
 ```yaml
 # .github/workflows/deploy.yml
 name: Deploy
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 jobs:
-  test:
+  # 단위 테스트 (필수)
+  unit-test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [backend, data-processor, web, mobile]
+    
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     
     - name: Setup Node.js
-      uses: actions/setup-node@v3
+      if: matrix.service != 'data-processor'
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: ${{ matrix.service }}/package-lock.json
+    
+    - name: Setup Python
+      if: matrix.service == 'data-processor'
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+    
+    - name: Install dependencies (Node.js)
+      if: matrix.service != 'data-processor'
+      working-directory: ${{ matrix.service }}
+      run: npm ci
+    
+    - name: Install dependencies (Python)
+      if: matrix.service == 'data-processor'
+      working-directory: ${{ matrix.service }}
+      run: |
+        pip install -r requirements.txt
+        pip install -r requirements-dev.txt
+    
+    - name: Run linter
+      working-directory: ${{ matrix.service }}
+      run: npm run lint || (cd ${{ matrix.service }} && flake8 src tests)
+    
+    - name: Run type check
+      if: matrix.service != 'data-processor'
+      working-directory: ${{ matrix.service }}
+      run: npm run type-check
+    
+    - name: Run type check (Python)
+      if: matrix.service == 'data-processor'
+      working-directory: ${{ matrix.service }}
+      run: mypy src
+    
+    # 필수: 단위 테스트 실행 및 커버리지 체크
+    - name: Run unit tests with coverage
+      working-directory: ${{ matrix.service }}
+      run: |
+        if [ "${{ matrix.service }}" == "data-processor" ]; then
+          pytest -v --cov=src --cov-report=xml --cov-report=term --cov-fail-under=80
+        else
+          npm run test:ci
+        fi
+    
+    # 필수: 커버리지 임계값 체크
+    - name: Check coverage threshold
+      working-directory: ${{ matrix.service }}
+      run: |
+        if [ "${{ matrix.service }}" == "data-processor" ]; then
+          COVERAGE=$(coverage report | grep "TOTAL" | awk '{print $4}' | sed 's/%//')
+        else
+          COVERAGE=$(npm run test:coverage --silent | grep "All files" | awk '{print $10}' | sed 's/%//')
+        fi
+        
+        if (( $(echo "$COVERAGE < 80" | bc -l) )); then
+          echo "❌ Coverage $COVERAGE% is below 80% threshold"
+          exit 1
+        fi
+        echo "✅ Coverage $COVERAGE% meets the 80% threshold"
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        files: ./${{ matrix.service }}/coverage/lcov.info,./${{ matrix.service }}/coverage.xml
+        flags: ${{ matrix.service }}
+        name: ${{ matrix.service }}-coverage
+        fail_ci_if_error: true
+  
+  # 통합 테스트 (필수)
+  integration-test:
+    runs-on: ubuntu-latest
+    needs: unit-test
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: signal_factory_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
       with:
         node-version: '18'
         cache: 'npm'
@@ -101,19 +223,18 @@ jobs:
     - name: Install dependencies
       run: npm ci
     
-    - name: Lint
-      run: npm run lint
-    
-    - name: Test
-      run: npm test
-    
-    - name: Build
-      run: npm run build
+    - name: Run integration tests
+      run: npm run test:integration
+      env:
+        DATABASE_URL: postgresql://test:test@localhost:5432/signal_factory_test
+        REDIS_URL: redis://localhost:6379
+        NODE_ENV: test
   
+  # 보안 스캔
   security:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     
     - name: Run Snyk security scan
       uses: snyk/actions/node@master
@@ -123,13 +244,14 @@ jobs:
     - name: Run CodeQL analysis
       uses: github/codeql-action/analyze@v2
   
+  # 빌드 (테스트 통과 필수)
   build:
-    needs: [test, security]
+    needs: [unit-test, integration-test, security]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
     
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v2
@@ -152,9 +274,14 @@ jobs:
         docker tag $ECR_REGISTRY/signal-factory:$IMAGE_TAG $ECR_REGISTRY/signal-factory:latest
         docker push $ECR_REGISTRY/signal-factory:latest
   
-  deploy:
+  # 배포 (프로덕션 - 모든 테스트 통과 필수)
+  deploy-production:
     needs: build
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://signal-factory.com
     
     steps:
     - name: Deploy to ECS
@@ -164,6 +291,81 @@ jobs:
         service: signal-factory-service
         cluster: production-cluster
         wait-for-service-stability: true
+    
+    - name: Run smoke tests
+      run: |
+        npm run test:smoke:production
+    
+    - name: Notify deployment
+      if: success()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: custom
+        custom_payload: |
+          {
+            text: '✅ Production deployment successful',
+            attachments: [{
+              color: 'good',
+              text: `Commit: ${{ github.sha }}\nAuthor: ${{ github.actor }}`
+            }]
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+  
+  # 배포 (스테이징)
+  deploy-staging:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: staging
+      url: https://staging.signal-factory.com
+    
+    steps:
+    - name: Deploy to ECS (Staging)
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+      with:
+        task-definition: task-definition.staging.json
+        service: signal-factory-staging-service
+        cluster: staging-cluster
+        wait-for-service-stability: true
+```
+
+### 브랜치 보호 규칙
+
+GitHub 리포지토리 설정에서 다음 규칙을 적용합니다:
+
+```yaml
+# .github/branch-protection.yml
+main:
+  required_status_checks:
+    strict: true
+    contexts:
+      - unit-test (backend)
+      - unit-test (data-processor)
+      - unit-test (web)
+      - unit-test (mobile)
+      - integration-test
+      - security
+  required_pull_request_reviews:
+    required_approving_review_count: 2
+    dismiss_stale_reviews: true
+    require_code_owner_reviews: true
+  enforce_admins: true
+  required_linear_history: false
+  allow_force_pushes: false
+  allow_deletions: false
+  
+develop:
+  required_status_checks:
+    strict: true
+    contexts:
+      - unit-test (backend)
+      - unit-test (data-processor)
+      - unit-test (web)
+      - unit-test (mobile)
+  required_pull_request_reviews:
+    required_approving_review_count: 1
 ```
 
 ## 모니터링
