@@ -249,30 +249,72 @@ app.get('/api/v1/signals/realtime',
 
 ### API 키 관리
 
+API 키는 외부 시스템에서 Signal Factory API를 안전하게 사용할 수 있도록 합니다. 상세한 API 키 발행 및 사용 방법은 [API 명세](./09_api_specifications.md#api-키-관리-외부-api-단독-사용)를 참조하세요.
+
 ```javascript
 class APIKeyService {
-  async generateKey(userId, description) {
-    const key = crypto.randomBytes(32).toString('hex');
+  async generateKey(userId, name, options = {}) {
+    // API 키 형식: sfk_{env}_{random}
+    const env = process.env.NODE_ENV === 'production' ? 'live' : 'test';
+    const random = crypto.randomBytes(32).toString('hex');
+    const key = `sfk_${env}_${random}`;
     const hash = await bcrypt.hash(key, 10);
+    
+    // 권한 범위 및 제한 설정
+    const {
+      scopes = ['logics:read'],
+      expiresAt = null,
+      ipWhitelist = [],
+      rateLimit = { requestsPerHour: 100, requestsPerDay: 1000 }
+    } = options;
     
     await db.apiKeys.create({
       userId,
+      name,
       keyHash: hash,
-      description,
-      createdAt: new Date()
+      keyPrefix: `sfk_${env}_${random.substring(0, 8)}...`, // 표시용
+      scopes,
+      expiresAt,
+      ipWhitelist,
+      rateLimit,
+      createdAt: new Date(),
+      status: 'active'
     });
     
     // 키는 한 번만 반환
     return key;
   }
   
-  async validateKey(key) {
+  async validateKey(key, requiredScope = null) {
     const allKeys = await db.apiKeys.findActive();
     
     for (const record of allKeys) {
       const valid = await bcrypt.compare(key, record.keyHash);
       if (valid) {
+        // 만료 확인
+        if (record.expiresAt && new Date() > record.expiresAt) {
+          throw new Error('API key expired');
+        }
+        
+        // IP 화이트리스트 확인
+        if (record.ipWhitelist.length > 0) {
+          const clientIp = this.getClientIp();
+          if (!this.isIpWhitelisted(clientIp, record.ipWhitelist)) {
+            throw new Error('IP not whitelisted');
+          }
+        }
+        
+        // 권한 확인
+        if (requiredScope && !record.scopes.includes(requiredScope)) {
+          throw new Error(`Insufficient permissions: ${requiredScope} required`);
+        }
+        
+        // Rate limit 확인
+        await this.checkRateLimit(record);
+        
+        // 사용 기록
         await this.recordUsage(record.id);
+        
         return record;
       }
     }
@@ -280,13 +322,107 @@ class APIKeyService {
     throw new Error('Invalid API key');
   }
   
+  async checkRateLimit(apiKey) {
+    const now = Date.now();
+    const hourAgo = now - 3600000;
+    const dayAgo = now - 86400000;
+    
+    const hourlyCount = await db.apiKeyUsage.count({
+      apiKeyId: apiKey.id,
+      timestamp: { $gte: hourAgo }
+    });
+    
+    const dailyCount = await db.apiKeyUsage.count({
+      apiKeyId: apiKey.id,
+      timestamp: { $gte: dayAgo }
+    });
+    
+    if (hourlyCount >= apiKey.rateLimit.requestsPerHour) {
+      throw new Error('Hourly rate limit exceeded');
+    }
+    
+    if (dailyCount >= apiKey.rateLimit.requestsPerDay) {
+      throw new Error('Daily rate limit exceeded');
+    }
+  }
+  
   async revokeKey(keyId, userId) {
     await db.apiKeys.update(keyId, {
+      status: 'revoked',
       revokedAt: new Date(),
       revokedBy: userId
     });
   }
+  
+  async rotateKey(keyId, userId) {
+    const oldKey = await db.apiKeys.findById(keyId);
+    
+    // 새 키 생성
+    const newKey = await this.generateKey(userId, oldKey.name, {
+      scopes: oldKey.scopes,
+      expiresAt: oldKey.expiresAt,
+      ipWhitelist: oldKey.ipWhitelist,
+      rateLimit: oldKey.rateLimit
+    });
+    
+    // 기존 키는 24시간 유예 기간 후 폐기
+    const graceExpiresAt = new Date(Date.now() + 86400000); // 24 hours
+    await db.apiKeys.update(keyId, {
+      expiresAt: graceExpiresAt,
+      replacedBy: newKey.id
+    });
+    
+    return { newKey, oldKeyExpiresAt: graceExpiresAt };
+  }
+  
+  isIpWhitelisted(clientIp, whitelist) {
+    for (const entry of whitelist) {
+      if (entry.includes('/')) {
+        // CIDR 체크
+        if (this.isIpInCidr(clientIp, entry)) {
+          return true;
+        }
+      } else if (clientIp === entry) {
+        return true;
+      }
+    }
+    return false;
+  }
 }
+
+// Express 미들웨어
+function apiKeyAuth(requiredScope = null) {
+  return async (req, res, next) => {
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ 
+        error: 'No API key provided' 
+      });
+    }
+    
+    const apiKey = authHeader.replace('Bearer ', '');
+    
+    try {
+      const keyRecord = await apiKeyService.validateKey(apiKey, requiredScope);
+      req.apiKey = keyRecord;
+      req.user = await db.users.findById(keyRecord.userId);
+      next();
+    } catch (error) {
+      return res.status(401).json({ 
+        error: error.message 
+      });
+    }
+  };
+}
+
+// 사용 예
+app.get('/api/v1/signals/realtime',
+  apiKeyAuth('signals:read'),
+  async (req, res) => {
+    // API 키로 인증된 요청 처리
+  }
+);
 ```
 
 ## Rate Limiting

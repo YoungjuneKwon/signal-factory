@@ -134,16 +134,60 @@
 ## 테스팅
 
 ### 단위 테스트
-- **Jest**: JavaScript 테스트 프레임워크
+
+#### 백엔드 (Node.js/TypeScript)
+- **Jest**: JavaScript/TypeScript 테스트 프레임워크
+- **Supertest**: HTTP API 테스트
+- **ts-jest**: TypeScript 지원
+- **@faker-js/faker**: 테스트 데이터 생성
+- **nock**: HTTP 모킹
+- **sinon**: Stub, Spy, Mock 라이브러리
+
+#### 백엔드 (Python)
+- **pytest**: Python 테스트 프레임워크
+- **pytest-cov**: 코드 커버리지
+- **pytest-asyncio**: 비동기 테스트
+- **pytest-mock**: 모킹 지원
+- **hypothesis**: 속성 기반 테스트
+- **factory_boy**: 테스트 데이터 팩토리
+
+#### 프론트엔드 (React)
+- **Jest**: 테스트 러너
 - **React Testing Library**: React 컴포넌트 테스트
-- **pytest**: Python 테스트
+- **@testing-library/jest-dom**: 커스텀 매처
+- **@testing-library/user-event**: 사용자 상호작용 시뮬레이션
+- **MSW (Mock Service Worker)**: API 모킹
+
+#### 프론트엔드 (React Native/Expo)
+- **Jest**: 테스트 프레임워크
+- **React Native Testing Library**: 컴포넌트 테스트
+- **@testing-library/react-native**: 네이티브 컴포넌트 테스트
+- **jest-expo**: Expo 프리셋
+
+### 통합 테스트
+- **Testcontainers**: Docker 기반 통합 테스트
+- **Supertest**: API 엔드포인트 통합 테스트
+- **@testing-library/react**: 컴포넌트 통합 테스트
 
 ### E2E 테스트
-- **Playwright**: 브라우저 자동화
+- **Playwright**: 브라우저 자동화 및 E2E 테스트
 - **Cypress**: E2E 테스트 (대안)
+- **Detox**: React Native E2E 테스트
 
 ### 부하 테스트
 - **k6**: 부하 테스트 도구
+- **Artillery**: HTTP/WebSocket 부하 테스트
+
+### 코드 커버리지
+- **Istanbul/nyc**: JavaScript 커버리지
+- **Coverage.py**: Python 커버리지
+- **Codecov**: 커버리지 리포팅 서비스
+
+### 테스트 품질 기준
+- **단위 테스트 커버리지**: 최소 80%
+- **핵심 비즈니스 로직**: 최소 90%
+- **통합 테스트**: 주요 API 엔드포인트 100%
+- **E2E 테스트**: 핵심 사용자 플로우 커버리지
 
 ## 개발 도구
 
