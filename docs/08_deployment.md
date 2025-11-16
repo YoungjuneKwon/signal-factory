@@ -72,6 +72,161 @@ spec:
   type: LoadBalancer
 ```
 
+## Serverless 우선 설계
+
+### 원칙
+
+Signal Factory는 **Serverless-first** 아키텍처를 지향하며, 관리형 서비스와 이벤트 기반 패턴을 우선 활용하여 운영 부담을 최소화하고 확장성과 비용 효율성을 극대화합니다.
+
+**핵심 설계 원칙:**
+
+- **Serverless-first 우선순위**: Cloudflare Workers, Pages, Durable Objects, KV, Queues, R2, GitHub Actions cron, managed Time-Series DB 등 관리형 서비스를 기본으로 채택
+- **Kubernetes 보완적 활용**: 장기 실행 프로세스, 높은 상태 복잡도, 특수 성능 요구사항이 있는 경우에만 K8s 사용
+- **데이터 수명주기 관리**: Hot (실시간 쿼리) ↔ Cool (분석) ↔ Cold (아카이브/P2P/IPFS) 계층화
+- **이벤트 기반 느슨한 결합**: Queues/PubSub를 통한 비동기 처리, 최소한의 영구 상태 (Durable Objects는 제한적 범위)
+- **다중 리전/벤더 복원력**: 벤더 종속성 최소화 및 지역 분산을 통한 고가용성 확보
+- **거버넌스**: 아티팩트 서명, SBOM, 최소 권한 원칙, 비밀 자동 교체
+
+### 기능별 실행/호스팅 모달리티 매핑
+
+| 기능/서브시스템 | 주 실행/호스팅 | 보완 대안 (K8s/Containers) | 자동화/트리거 | 데이터/아티팩트 저장소 | 보안/거버넌스 포인트 |
+|---|---|---|---|---|---|
+| **실시간 신호 생성** | Cloudflare Workers (Edge) | ECS/K8s (long-running listener) | WebSocket/SSE, Queue trigger | Cloudflare KV (캐시), PostgreSQL (영구) | WASM 격리, Rate limiting, API key rotation |
+| **백테스트 실행** | GitHub Actions (cron/manual), Durable Objects (orchestration) | K8s Jobs (대규모 병렬) | cron schedule, Queue (on-demand) | R2 (결과), IPFS (historical data distribution) | Artifact signing, Ephemeral credentials, Audit log |
+| **웹 UI 배포** | Cloudflare Pages | Vercel, K8s (static serve) | Git push (main), PR preview | R2/CDN (assets), KV (metadata) | CSP headers, SRI, HTTPS-only |
+| **API 서비스** | Cloudflare Workers (stateless), Durable Objects (stateful sessions) | ECS/K8s (complex API) | HTTP request, Queue consumer | PostgreSQL/Neon, KV (cache) | JWT validation, mTLS, Secrets Manager |
+| **데이터 수집기** | GitHub Actions cron, Cloudflare Workers (scheduled) | K8s CronJob (high-freq) | cron (hourly/daily), event webhook | TimescaleDB/InfluxDB Cloud, R2 (raw) | Encrypted at rest, Least privilege IAM, Input validation |
+| **전략 샌드박스** | Cloudflare Workers (WASM) | K8s (isolated pods) | API call, Queue | Durable Objects (state), R2 (code bundles) | Resource/time limits, Deterministic seeding, Code signing |
+| **모바일 API 백엔드** | Cloudflare Workers (global edge) | K8s (regional fallback) | HTTPS/GraphQL | KV (session), PostgreSQL | Auth0/Clerk integration, Rate limiting |
+| **일괄 데이터 분석** | GitHub Actions (matrix), Durable Objects (coordination) | K8s Spark/Flink | cron (weekly), manual dispatch | R2 (Parquet), ClickHouse Cloud | SBOM, Environment isolation |
+| **아카이브 스냅샷** | GitHub Actions cron | K8s CronJob | cron (daily) | R2 → IPFS (public historical data), Glacier (long-term) | Content hashing, Signature verification |
+| **알림/통지** | Cloudflare Queues → Workers | K8s (notification service) | Queue event | KV (subscriptions), R2 (templates) | Encrypted payloads, User consent |
+| **메트릭/모니터링** | Prometheus Cloud, Grafana Cloud, Cloudflare Analytics | K8s (Prometheus/Grafana) | scrape interval, push gateway | Managed TSDB (Prometheus Cloud) | Access control, Retention policies |
+| **CI/CD 파이프라인** | GitHub Actions | Jenkins on K8s (legacy) | Git push, PR, cron | GitHub Container Registry, R2 (cache) | OIDC auth, Secret scanning, Branch protection |
+
+### 지속 가능성 원칙
+
+- **Serverless-first 선택 로직**:
+  - 상태가 없거나 최소 상태 → Cloudflare Workers/GitHub Actions
+  - 단기 실행 (<15분), 이벤트 기반 → Serverless 함수
+  - 장기 실행, 복잡한 상태 관리 → Durable Objects 또는 K8s (최후 수단)
+  - 글로벌 저지연 요구 → Cloudflare Workers (Edge)
+
+- **데이터 수명주기 관리**:
+  - **Hot**: 실시간 쿼리 (KV, PostgreSQL, TimescaleDB)
+  - **Cool**: 분석/집계 (ClickHouse Cloud, R2 Parquet)
+  - **Cold**: 아카이브/공개 배포 (IPFS, Glacier, R2 Infrequent Access)
+  - 자동 수명주기 정책 (R2 → IPFS after 90 days)
+
+- **이벤트 구동 &amp; 내결함성 패턴**:
+  - Circuit Breaker: 외부 API 실패 시 자동 차단 및 폴백
+  - Exponential Backoff: 재시도 간격 증가 (최대 5회)
+  - Dead Letter Queue: 실패한 메시지 격리 및 분석
+  - Idempotency Keys: 중복 처리 방지
+
+- **멀티 리전/벤더 전략**:
+  - Primary: Cloudflare (Edge), GitHub Actions
+  - Fallback: AWS (ECS/Lambda), Vercel
+  - 데이터: PostgreSQL (Neon multi-region), R2 + IPFS
+  - DNS/CDN: Cloudflare with AWS Route53 failover
+
+- **GitOps &amp; 재현성**:
+  - 모든 인프라 변경은 PR/GitHub Actions를 통해 추적
+  - Terraform/Pulumi로 IaC 관리
+  - Docker 이미지 태그 고정 (semantic versioning)
+  - 환경별 Config-as-Code (dev/staging/prod)
+
+### 운영 워크플로 예시
+
+#### 1. 실시간 신호 처리
+
+**시나리오**: 사용자가 웹 UI에서 실시간 신호를 구독하면, Edge에서 신호를 생성하여 WebSocket으로 푸시
+
+**흐름**:
+1. 사용자가 Cloudflare Pages (Web UI)에서 신호 구독 요청
+2. Cloudflare Workers API가 요청을 받아 KV에 구독 정보 저장
+3. Durable Object (SignalProcessor)가 WebSocket 연결 유지 및 신호 생성
+4. 데이터 수집기 (GitHub Actions cron)가 시장 데이터를 R2 및 PostgreSQL에 저장
+5. Durable Object가 새 데이터를 감지하면 신호 계산 실행 (WASM 샌드박스)
+6. 계산된 신호를 WebSocket으로 클라이언트에 전송
+7. Cloudflare Analytics로 성능 메트릭 수집
+
+**장점**: 글로벌 저지연 (<50ms), 자동 확장, 상태 관리 격리
+
+#### 2. 일괄 백테스트
+
+**시나리오**: 사용자가 과거 데이터로 전략 성능 검증
+
+**흐름**:
+1. 사용자가 Web UI에서 백테스트 요청 (날짜 범위, 전략 코드)
+2. Cloudflare Workers API가 요청을 Cloudflare Queue에 전송
+3. GitHub Actions (manual dispatch)가 Queue 이벤트를 감지하여 백테스트 Job 시작
+4. Job이 R2/IPFS에서 historical 데이터 로드 (Parquet 형식)
+5. 전략 코드를 WASM으로 컴파일하여 샌드박스 실행 (deterministic seeding)
+6. 결과 (성과 지표, 차트)를 R2에 저장하고 아티팩트 서명
+7. 결과 URL을 사용자에게 반환 (Cloudflare Workers API)
+8. Grafana Cloud에 백테스트 메트릭 (실행 시간, 성공률) 기록
+
+**장점**: 비용 효율적 (cron 기반, on-demand), 재현 가능, 격리된 실행
+
+#### 3. 아카이브 스냅샷 배포
+
+**시나리오**: 일일 시장 데이터 스냅샷을 IPFS에 배포하여 커뮤니티와 공유
+
+**흐름**:
+1. GitHub Actions cron (매일 02:00 UTC)이 스냅샷 Job 트리거
+2. Job이 PostgreSQL/TimescaleDB에서 전날 데이터 추출
+3. Parquet 형식으로 압축 및 SBOM 생성
+4. R2에 스냅샷 업로드 (versioning 활성화)
+5. IPFS 노드에 스냅샷 고정 (pinning) 및 CID 생성
+6. Cloudflare KV에 최신 CID 및 메타데이터 저장
+7. Web UI에서 IPFS 게이트웨이 링크 제공 (예: ipfs.io/ipfs/{CID})
+8. Slack/Discord 웹훅으로 배포 알림 전송
+
+**장점**: 탈중앙화 배포, 영구 보관, 무료 대역폭 (P2P)
+
+### 전략 샌드박스 실행
+
+**개요**: 사용자 제공 전략 코드를 안전하게 실행하기 위한 격리 환경
+
+**구현**:
+- **WASM 격리**: Cloudflare Workers의 V8 Isolate를 활용하여 각 전략을 독립 실행
+- **리소스 제한**:
+  - CPU 시간: 최대 50ms (실시간), 10초 (백테스트)
+  - 메모리: 128MB
+  - 네트워크: 차단 (데이터는 사전 제공)
+- **시간 제한**: Timeout 설정으로 무한 루프 방지
+- **Deterministic Seeding**: 난수 생성 시드 고정으로 백테스트 재현성 보장
+- **코드 서명**: 전략 코드 해시를 KV에 저장하여 변경 감지
+- **Audit Log**: 모든 실행 로그를 R2에 저장 (사용자별, 전략별)
+
+**예시 코드**:
+```javascript
+// Cloudflare Worker - 전략 실행 샌드박스
+export default {
+  async fetch(request, env) {
+    const { strategyCode, marketData, seed } = await request.json();
+    
+    // WASM 모듈 로드 및 실행
+    const wasmModule = await WebAssembly.instantiate(strategyCode);
+    const result = wasmModule.exports.execute(marketData, seed);
+    
+    // 결과 저장 및 반환
+    await env.RESULTS.put(`result:${Date.now()}`, JSON.stringify(result));
+    return new Response(JSON.stringify(result), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+};
+```
+
+### 관련 문서
+
+- [아키텍처 개요](./01_architecture_overview.md) - 전체 시스템 구조 및 마이크로서비스 구성
+- [데이터 파이프라인](./02_data_pipeline.md) - 데이터 수집, 정규화, 저장 흐름
+- [신호 생성](./03_signal_generation.md) - 신호 로직 엔진 및 백테스트 프레임워크
+- [보안](./07_security.md) - 인증, 권한, 암호화, 감사 로그
+
 ## CI/CD 파이프라인
 
 ### GitHub Actions
